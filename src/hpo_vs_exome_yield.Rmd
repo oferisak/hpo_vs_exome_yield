@@ -13,7 +13,8 @@ output:
 
 
 ```{r initial_setup}
-hpo_analysis_folder<-'/media/SSD/Bioinformatics/Projects/hpo_vs_exome_yield/'
+hpo_analysis_folder<-'/media/SSD/Bioinformatics/Projects/hpo_vs_exome_yield'
+hpo_data_file<-glue('{hpo_analysis_folder}/data/accessory_data/hpo_vs_result_20220413.csv')
 
 ```
 
@@ -26,6 +27,7 @@ render('/media/SSD/Bioinformatics/Projects/hpo_vs_exome_yield/src/hpo_vs_exome_y
 ```
 
 ```{r setup, include=FALSE,warning=F,message=F}
+main_output_folder<-glue('./output/hpo_vs_yield_{Sys.Date()}')
 
 project_dir<-hpo_analysis_folder
 knitr::opts_knit$set(root.dir=project_dir)
@@ -34,151 +36,109 @@ library(ProjectTemplate)
 setwd(project_dir)
 load.project()
 
-main_output_folder<-glue('./output/hpo_vs_yield_{Sys.Date()}')
 if (!dir.exists(main_output_folder)){dir.create(main_output_folder)}
 
 ```
 
-```{r load_data}
-hpo_data_file<-'/media/SSD/Bioinformatics/Projects/hpo_vs_exome_yield/data/accessory_data/hpo_vs_result_20220413.csv'
-hpo_raw_data<-readr::read_delim(hpo_data_file)
-
-hpo_data<-hpo_raw_data%>%mutate(id=row_number(),.before=1,
-                                solved=factor(ifelse(is.na(`Most likely gene - solved`),'N','Y')))
-hpos_long<-hpo_data%>%separate_rows(Symptoms,sep = ',')%>%mutate(hpo_name=tolower(trimws(Symptoms)),.keep='unused')
-# fix some fields
-hpos_long<-hpos_long%>%mutate(hpo_name=case_when(
-  hpo_name=='seizure'~'seizures',
-  TRUE~as.character(hpo_name)
-))
-
-```
-
-
 ```{r grab_hpo_ids_using_api}
-hpo_terms_with_id_raw<-NULL
-for (query in hpo_terms$hpo_name){
-  print(query)
-  query_res<-hpo_search_query(query)
-  print(query_res)
-  if (class(query_res)=='list'){
-    hpo_id<-NA
-    matching_hpo_term<-NA
-  }else{# if the term returned results
-    # check if one of the results is an exact match
-    query_in_term<-which(tolower(query_res$name)==query)
-    # if the query was not found, grab the first row otherwise grab the exact match
-    to_grab<-ifelse(identical(query_in_term,integer(0)),1,query_in_term)
-    hpo_id<-query_res%>%slice(to_grab)%>%pull(ontologyId)
-    matching_hpo_term<-query_res%>%slice(to_grab)%>%pull(name)
-  }
-  hpo_terms_with_id_raw<-hpo_terms_with_id_raw%>%rbind(data.frame(hpo_name=query,matching_hpo_term,hpo_id=hpo_id))
-}
-# check if term is the same
-hpo_terms_with_id_raw<-hpo_terms_with_id_raw%>%mutate(exact_match=hpo_name==tolower(matching_hpo_term))
-# exact matches
-hpo_terms_with_id<-hpo_terms_with_id_raw%>%filter(exact_match)
-# now collect non exact and missing
-missing_hpo_terms<-hpo_terms_with_id_raw%>%filter(is.na(hpo_id))
-writexl::write_xlsx(missing_hpo_terms,path=glue('{main_output_folder}/missing_hpo_terms_{Sys.Date()}.xlsx')) 
-non_exact_hpo_terms<-hpo_terms_with_id_raw%>%filter(!(exact_match))
-writexl::write_xlsx(non_exact_hpo_terms,path=glue('{main_output_folder}/non_exact_hpo_terms_{Sys.Date()}.xlsx')) 
-# save exact matches
-write.table(hpo_terms_with_id,file='./data/hpo_term_to_id.csv',sep='\t',row.names = F)
+# run this only once for each raw input hpo table. it fixes it and writes a new table that includes the conversion between the specified hpos, their id, and whether there is an exact match into - ./data/hpo_term_to_id.csv
 
+# fix_input_hpo_table(hpo_terms)
+
+# once the hpo table is fixed, read it and use only it.
+hpo_term_to_id<-readr::read_delim('./data/hpo_term_to_id.csv')
+# filter out all the hpos that an hpo id was not found for them
+hpos_with_ids<-hpos_long%>%left_join(hpo_term_to_id)%>%filter(!is.na(hpo_id))%>%
+  mutate(matching_hpo_term=tolower(matching_hpo_term))
 ```
 
 ```{r load_data,message=F}
-hpo_term_to_id<-readr::read_delim('./data/hpo_term_to_id.csv')
-hpos_with_ids<-hpos_long%>%left_join(hpo_term_to_id)%>%filter(!is.na(hpo_id))
-
+# For each hpo - count the number of solved cases
 hpo_vs_solved<-hpos_with_ids%>%group_by(matching_hpo_term)%>%summarize(n=n(),
                                                            solved=sum(solved=='Y'),
                                                            solved_rate=solved/n)
 
+
 # now check whether a certain hpo is associated with a higher yield
+hpo_names<-unique(hpos_with_ids$matching_hpo_term)
+hpo_vs_solved_association_test_res<-furrr::future_map_dfr(hpo_names,function(x) test_hpo_vs_solved(x,hpos_with_ids))
+# fix p.values
+hpo_vs_solved_association_test_res<-hpo_vs_solved_association_test_res%>%
+  mutate(p.adjust=p.adjust(p.value,method='BH'))
 
-test_hpo_vs_solved<-function(hpo_to_test){
-  tmp_table<-hpos_with_ids%>%select(hpo_name,solved)%>%mutate(!!sym(hpo_to_test):=ifelse(hpo_name==hpo_to_test,1,0))
-  hpo_glm_res<-glm(as.formula(glue('solved~`{hpo_to_test}`')),data=tmp_table,family='binomial')
-  hpo_tidy_res<-broom::tidy(hpo_glm_res)
-  return(data.frame(hpo_name=hpo_to_test,hpo_tidy_res%>%slice(2)%>%select(estimate,p.value)))
-}
-
-hpo_names<-unique(hpos_with_ids$hpo_name)
-hpo_glm_test_res<-purrr::map_dfr(hpo_names,test_hpo_vs_solved)
-hpo_vs_solved<-hpo_vs_solved%>%left_join(hpo_glm_test_res,by=c('matching_hpo_term'='hpo_name'))
+hpo_vs_solved<-hpo_vs_solved%>%left_join(hpo_vs_solved_association_test_res,by=c('matching_hpo_term'='hpo_name'))
 
 writexl::write_xlsx(hpo_vs_solved,path=glue('{main_output_folder}/hpo_vs_solved_{Sys.Date()}.xlsx'))
 
-# number of hpos vs yield
-num_hpo_vs_yield<-hpos_with_ids%>%ungroup()%>%group_by(id,solved)%>%dplyr::summarize(n=n())%>%ungroup()
-num_hpo_vs_yield%>%ggplot(aes(x=n,fill=solved))+
-  geom_density(alpha=0.3)+
-  labs(x='number of HPOs')+
-  theme_minimal()+theme(legend.position = 'top')+
-  ggsci::scale_fill_nejm()
-
-# create a factor variable with the number of hpos
-num_hpo_vs_yield%>%mutate(num_hpos=factor(case_when(
-  n<=10~as.character(n),
-  n>10~'>10'
-)))%>%ggplot(aes(x=num_hpos,fill=solved))+
-  geom_bar(position='fill')
-
-# compare the number of hpos in the solved cases vs the unsolved
-t.test(n~solved,data=num_hpo_vs_yield)
-# now check whether number of hpos is associated with being solved
-glm_res<-glm(solved~n,data=num_hpo_vs_yield,family = 'binomial')
-broom::tidy(glm_res)
-
 
 # now look at combinations
-
 # to check combinations, first find all the combinations for each id and then join them together
-ids_with_more_than_one_hpo<-hpos_with_ids%>%group_by(id)%>%summarize(n=n())%>%filter(n>1)
+ids_with_more_than_one_hpo<-hpos_with_ids%>%
+  group_by(id)%>%summarize(n=n())%>%
+  filter(n>1)
+
 hpos_with_combinations<-hpos_with_ids%>%
   filter(id %in% ids_with_more_than_one_hpo$id)%>%
   group_by(id,solved)%>%
   summarize(data.frame(t(combn(matching_hpo_term,2))))%>%ungroup()%>%
-  rowwise()%>%mutate(hpo_comb=paste0(sort(c(X1,X2)),collapse='_'))
+  rowwise()%>%mutate(hpo_name=paste0(sort(c(X1,X2)),collapse='_'))
 
-hpo_comb_vs_solved<-hpos_with_combinations%>%group_by(hpo_comb)%>%summarize(n=n(),
-                                                           solved=sum(solved=='Y'),
-                                                           solved_rate=solved/n)%>%
+
+hpo_comb_vs_solved <- hpos_with_combinations %>%
+  group_by(hpo_name) %>%
+  summarize(
+    n = n(),
+    solved = sum(solved =='Y'),
+    solved_rate =solved / n) %>%
   arrange(desc(n))
 
-test_comb_vs_solved<-function(hpo_to_test){
-  tmp_table<-hpos_with_combinations%>%select(hpo_comb,solved)%>%mutate(!!sym(hpo_to_test):=ifelse(hpo_comb==hpo_to_test,1,0))
-  hpo_glm_res<-glm(as.formula(glue('solved~`{hpo_to_test}`')),data=tmp_table,family='binomial')
-  hpo_tidy_res<-broom::tidy(hpo_glm_res)
-  return(data.frame(hpo_name=hpo_to_test,hpo_tidy_res%>%slice(2)%>%select(estimate,p.value)))
-}
+# test only combinations with at least 5 occurances
+combs_to_test<-hpo_comb_vs_solved%>%filter(n>5)%>%pull(hpo_name)
+hpo_comb_vs_solved_association_test_res<-furrr::future_map_dfr(combs_to_test,function(x) test_hpo_vs_solved(x,hpos_with_combinations))
+# fix p value
+hpo_comb_vs_solved_association_test_res<-hpo_comb_vs_solved_association_test_res%>%
+  mutate(p.adjust=p.adjust(p.value,method='BH'))
 
-combs_to_test<-hpo_comb_vs_solved%>%filter(n>10)%>%pull(hpo_comb)
-hpo_comb_glm_test_res<-purrr::map_dfr(combs_to_test,test_comb_vs_solved)
-
-
-hpo_comb_vs_solved<-hpo_comb_vs_solved%>%left_join(hpo_comb_glm_test_res,by=c('hpo_comb'='hpo_name'))
+hpo_comb_vs_solved<-hpo_comb_vs_solved%>%left_join(hpo_comb_vs_solved_association_test_res)
 
 writexl::write_xlsx(hpo_comb_vs_solved,path=glue('{main_output_folder}/hpo_comb_vs_solved_{Sys.Date()}.xlsx'))
 ```
 
+
 ```{r hpo_ancestry_analysis}
 hpo_obo<-parse_hpo_obo()
-
+hpo_obo$name<-tolower(hpo_obo$name)
 # for each hpo id in the file, get all ancestors
 hpo_ids<-hpos_with_ids%>%pull(hpo_id)%>%unique()
 hpos_with_ancestors<-get_hpo_ancestors(hpo_ids,hpo_obo)
-hpos_with_descendants<-get_hpo_descendants(hpo_ids,hpo_obo)
+#hpos_with_descendants<-get_hpo_descendants(hpo_ids,hpo_obo)
+# now get all the ancestors for each hpo_name
+hpos_with_ids_with_ancestors<-hpos_with_ids%>%
+  left_join(hpos_with_ancestors)%>%
+  mutate(ancestor_name=tolower(ancestor_name))
 
-hpos_with_ids_with_ancestors<-hpos_with_ids%>%left_join(hpos_with_ancestors)
-
-hpo_with_ancestors_vs_solved<-hpos_with_ids_with_ancestors%>%group_by(id,ancestor_name,ancestor,solved)%>%summarize(n=n())%>%
-  ungroup()%>%group_by(ancestor_name,ancestor)%>%summarize(n=n(),
-                                                           solved=sum(solved=='Y'),
-                                                           solved_rate=solved/n)%>%
+# now for each ancestor, count the number of solved cases
+hpo_with_ancestors_vs_solved <- hpos_with_ids_with_ancestors %>%
+  group_by(id, ancestor_name, ancestor, solved) %>% summarize(n = n()) %>%
+  ungroup() %>%
+  group_by(ancestor_name, ancestor) %>% 
+  summarize(
+    n = n(),
+    solved = sum(solved =='Y'),
+    solved_rate =solved / n
+    ) %>%
+  rename(hpo_name='ancestor_name')%>%
+  mutate(hpo_name=tolower(hpo_name))%>%
   arrange(desc(n))
+
+hpos_table<-hpos_with_ids_with_ancestors%>%mutate(hpo_name=ancestor_name)
+ancestors_to_test<-hpo_with_ancestors_vs_solved%>%filter(n>10)%>%pull(hpo_name)%>%unique()
+hpo_vs_solved_association_test_res<-furrr::future_map_dfr(ancestors_to_test,function(x) test_hpo_ancestry_vs_solved(x,hpos_table))
+
+# fix p value
+hpo_vs_solved_association_test_res<-hpo_vs_solved_association_test_res%>%
+  mutate(p.adjust=p.adjust(p.value,method='BH'))
+hpo_with_ancestors_vs_solved<-hpo_with_ancestors_vs_solved%>%left_join(hpo_vs_solved_association_test_res)
 
 # for each hpo term in the ancestry table - add all the descendants that were found in the original table
 hpo_with_ancestors_vs_solved<-hpo_with_ancestors_vs_solved%>%
@@ -188,42 +148,6 @@ hpo_with_ancestors_vs_solved<-hpo_with_ancestors_vs_solved%>%
          nchars=nchar(descendants))%>%
   mutate(descendants=ifelse(nchars>1000,'Too many descendants',descendants))
 hpo_with_ancestors_vs_solved
-
-# what i did- for each hpo term in the ancestor table, i:
-## create the original table
-## join all the term's descendants under the hpo term
-## remove all the ancestors of that hpo term from the table 
-## create a logistic regression for the association between the term and the solved status
-
-n_cases<-hpo_with_ancestors_vs_solved%>%filter(ancestor_name=='All')%>%pull(n)
-expected_solved_prob<-hpo_with_ancestors_vs_solved%>%filter(ancestor_name=='All')%>%pull(solved)/n_cases
-expected_unsolved_prob<-1-expected_solved_prob
-
-test_ancestor_vs_solved<-function(test_hpo_name){
-  print(test_hpo_name)
-  test_hpo_id<-names(hpo_obo$name[which(hpo_obo$name==test_hpo_name)])
-  hpo_ancestors<-get_hpo_ancestors(test_hpo_id,hpo_obo)%>%filter(hpo_id==test_hpo_id,ancestor!=test_hpo_id)%>%pull(ancestor)
-  hpo_descendants<-get_hpo_descendants(test_hpo_id,hpo_obo)%>%filter(hpo_id==test_hpo_id,descendant!=test_hpo_id)%>%pull(descendant)
-  test_hpo_name<-tolower(test_hpo_name)
-  # start with the regular hpos table
-  tmp_table<-hpos_with_ids%>%select(id,hpo_name,hpo_id,solved)
-  # now for the given ancestor replace every descendant in the list with it 
-  tmp_table<-tmp_table%>%mutate(hpo_name=ifelse(hpo_id%in%hpo_descendants,test_hpo_name,hpo_name))
-  tmp_table<-tmp_table%>%select(id,hpo_name,solved)%>%mutate(!!sym(test_hpo_name):=ifelse(hpo_name==test_hpo_name,1,0))%>%distinct()
-  count_table<-tmp_table%>%count(solved)
-  chisqr_res<-broom::tidy(chisq.test(count_table$n,p=c(expected_unsolved_prob,expected_solved_prob)))
-  return(data.frame(test_hpo_name=test_hpo_name,hpo_solved_vs_unsolved,chisqr_res))
-}
-
-ancestors_to_test<-hpo_with_ancestors_vs_solved%>%filter(n>10)%>%pull(ancestor_name)
-library(furrr)
-future::plan(multicore)
-
-ancestor_glm_test_res<-purrr::map_dfr(ancestors_to_test,test_ancestor_vs_solved)
-ancestor_glm_test_res<-furrr::future_map_dfr(ancestors_to_test,test_ancestor_vs_solved)
-
-hpo_with_ancestors_vs_solved<-hpo_with_ancestors_vs_solved%>%mutate(ancestor_name=tolower(ancestor_name))%>%
-  left_join(ancestor_glm_test_res,by=c('ancestor_name'='test_hpo_name'))
 
 writexl::write_xlsx(hpo_with_ancestors_vs_solved,path=glue('{main_output_folder}/hpo_with_ancestors_vs_solved_{Sys.Date()}.xlsx'))
 
@@ -261,7 +185,41 @@ ancestors_comb_vs_solved<-ancestors_with_combinations_without_related%>%group_by
                                                            solved_rate=solved/n)%>%
   arrange(desc(n))
 
+
+hpos_table<-ancestors_with_combinations_without_related%>%mutate(hpo_name=hpo_comb_name)
+combs_to_test<-ancestors_comb_vs_solved%>%filter(n>10)%>%pull(hpo_comb_name)%>%unique()
+combs_vs_solved_association_test_res<-furrr::future_map_dfr(combs_to_test,function(x) test_hpo_vs_solved(x,hpos_table))
+
+#combs_vs_solved_association_test_res<-purrr::map_dfr(combs_to_test,function(x) test_hpo_vs_solved(x,hpos_table))
+
+# fix p value
+combs_vs_solved_association_test_res<-combs_vs_solved_association_test_res%>%
+  mutate(p.adjust=p.adjust(p.value,method='BH'))
+ancestors_comb_vs_solved<-ancestors_comb_vs_solved%>%left_join(combs_vs_solved_association_test_res,by=c('hpo_comb_name'='hpo_name'))
+
 writexl::write_xlsx(ancestors_comb_vs_solved%>%filter(n>10),path=glue('{main_output_folder}/ancestors_comb_vs_solved_{Sys.Date()}.xlsx'))
 
 ```
 
+```{r plot_hpos_vs_solved}
+# number of hpos vs yield
+num_hpo_vs_yield<-hpos_with_ids%>%ungroup()%>%group_by(id,solved)%>%dplyr::summarize(n=n())%>%ungroup()
+num_hpo_vs_yield%>%ggplot(aes(x=n,fill=solved))+
+  geom_density(alpha=0.3)+
+  labs(x='number of HPOs')+
+  theme_minimal()+theme(legend.position = 'top')+
+  ggsci::scale_fill_nejm()
+
+# create a factor variable with the number of hpos
+num_hpo_vs_yield%>%mutate(num_hpos=factor(case_when(
+  n<=10~as.character(n),
+  n>10~'>10'
+)))%>%ggplot(aes(x=num_hpos,fill=solved))+
+  geom_bar(position='fill')
+
+# compare the number of hpos in the solved cases vs the unsolved
+t.test(n~solved,data=num_hpo_vs_yield)
+# now check whether number of hpos is associated with being solved
+glm_res<-glm(solved~n,data=num_hpo_vs_yield,family = 'binomial')
+broom::tidy(glm_res)
+```
