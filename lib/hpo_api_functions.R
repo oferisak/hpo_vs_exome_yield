@@ -40,3 +40,18 @@ get_hpo_ancestors<-function(hpo_ids,hpo_obo){
   return(hpos_with_ancestors)
 }
 
+get_hpo_descendants<-function(hpo_ids,hpo_obo){
+  names(hpo_ids)<-hpo_ids
+  per_hpo_descendants<-hpo_ids%>%purrr::map(function(x) ontologyIndex::get_descendants(hpo_obo,x))
+  hpos_with_descendants<-NULL
+  for (hpo_id in names(per_hpo_descendants)){
+    hpos_with_descendants<-hpos_with_descendants%>%
+      bind_rows(data.frame(hpo_id=hpo_id,descendant=per_hpo_descendants[[hpo_id]]))
+  }
+  # now add the names for each hpo ancestor
+  descendant_names<-hpos_with_descendants$descendant%>%unique()%>%
+    purrr::map_df(function(x) data.frame(descendant=x,descendant_name=hpo_obo%>%ontologyIndex::get_term_property('name',x)))
+  hpos_with_descendants<-hpos_with_descendants%>%left_join(descendant_names)
+  return(hpos_with_descendants)
+}
+
